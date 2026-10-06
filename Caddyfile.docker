@@ -1,0 +1,20 @@
+{
+    auto_https off
+    admin off
+    aspnetcore {
+        app sample {
+            assembly /app/sample/CaddySharp.Sample.dll
+            runtime_config /app/bridge/CaddySharp.runtimeconfig.json
+            native_library /app/bridge/CaddySharpNE.so
+            content_root /app/sample
+            environment Production
+            env SampleSettings__Value example
+            max_request_body 1MB
+            max_response_body 4MB
+            shutdown_timeout 30s
+        }
+    }
+}
+http://:8080 {
+    aspnetcore sample
+}

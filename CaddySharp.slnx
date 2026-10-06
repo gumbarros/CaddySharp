@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="Dockerfile" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/CaddySharp/CaddySharp.csproj" />
+    <Project Path="src/CaddySharp.Sample/CaddySharp.Sample.csproj" />
+  </Folder>
+</Solution>

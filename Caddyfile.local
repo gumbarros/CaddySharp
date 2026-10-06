@@ -1,0 +1,20 @@
+{
+    auto_https off
+    admin localhost:2019
+    aspnetcore {
+        app sample {
+            assembly /home/gumbarros/RiderProjects/CaddySharp/src/CaddySharp.Sample/bin/Release/net10.0/CaddySharp.Sample.dll
+            runtime_config /home/gumbarros/RiderProjects/CaddySharp/src/CaddySharp/bin/Release/net10.0/linux-x64/CaddySharp.runtimeconfig.json
+            native_library /home/gumbarros/RiderProjects/CaddySharp/src/CaddySharp/bin/Release/net10.0/linux-x64/CaddySharpNE.so
+            content_root /home/gumbarros/RiderProjects/CaddySharp/src/CaddySharp.Sample
+            environment Production
+            env SampleSettings__Value example
+            max_request_body 1MB
+            max_response_body 4MB
+            shutdown_timeout 30s
+        }
+    }
+}
+http://127.0.0.1:8080 {
+    aspnetcore sample
+}
