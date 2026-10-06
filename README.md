@@ -2,7 +2,9 @@
 
 Run an ASP.NET Core app inside a Caddy process. Caddy accepts the HTTP request and passes it to ASP.NET Core through a Go/C bridge, without a separate Kestrel server or a loopback proxy connection.
 
-**Status:** experimental MVP for Linux x64, .NET 10, and one ASP.NET Core app per process. It is not ready as a general Kestrel replacement.
+> [!WARNING]
+> **This is experimental software.**
+> Contributions to the Go implementation are very welcome.
 
 ## Why
 
