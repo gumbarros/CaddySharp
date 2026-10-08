@@ -5,6 +5,11 @@ namespace CaddySharp;
 
 public sealed class CaddyServer : IServer
 {
+    private readonly BridgeHost _host;
+    public CaddyServer() : this(BridgeHost.Current ?? throw new InvalidOperationException("No CaddySharp app is starting.")) { }
+
+    internal CaddyServer(BridgeHost host) => _host = host;
+
     private Func<FeatureCollection, Task>? _process;
     public IFeatureCollection Features { get; } = new FeatureCollection();
 
@@ -15,7 +20,6 @@ public sealed class CaddyServer : IServer
     public Task StartAsync<TContext>(IHttpApplication<TContext> application, CancellationToken cancellationToken)
         where TContext : notnull
     {
-        BridgeHost.Server = this;
         _process = async features =>
         {
             var context = application.CreateContext(features);
@@ -34,7 +38,7 @@ public sealed class CaddyServer : IServer
                 application.DisposeContext(context, error);
             }
         };
-        BridgeHost.ServerStarted.TrySetResult();
+        _host.Started(this);
         return Task.CompletedTask;
     }
 

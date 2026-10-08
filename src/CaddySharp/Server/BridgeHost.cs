@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.Loader;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Hosting;
@@ -6,43 +7,58 @@ using Microsoft.Extensions.Primitives;
 
 namespace CaddySharp;
 
-internal static class BridgeHost
+internal sealed class BridgeHost
 {
-    internal static CaddyServer? Server;
-    internal static string? Signature;
-
-    internal static readonly TaskCompletionSource ServerStarted =
-        new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    internal static Task? EntryPointTask;
-    internal static IHostApplicationLifetime? Lifetime;
-
-    internal static int Init(string assembly, string contentRoot, string environment, Dictionary<string, string> config)
+    private sealed class AppLoadContext(string assembly) : AssemblyLoadContext(isCollectible: true)
     {
-        lock (typeof(BridgeHost))
+        private readonly AssemblyDependencyResolver _resolver = new(assembly);
+        protected override Assembly? Load(AssemblyName name)
         {
-            var signature = assembly + "|" + contentRoot + "|" + environment + "|" +
-                            string.Join("|", config.OrderBy(x => x.Key).Select(x => x.Key + "=" + x.Value));
-            if (EntryPointTask != null) return Signature == signature ? 0 : -2;
+            var path = _resolver.ResolveAssemblyToPath(name);
+            return path is null ? null : LoadFromAssemblyPath(path);
+        }
+    }
+
+    private static readonly AsyncLocal<BridgeHost?> Starting = new();
+    private static readonly Lock Gate = new();
+    private static readonly Dictionary<nint, BridgeHost> Hosts = new();
+    private static long _nextId;
+    private static bool _registered;
+    private AppLoadContext? _loadContext;
+    private Task? _entryPointTask;
+    private readonly TaskCompletionSource _serverStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    internal CaddyServer? Server;
+    internal IHostApplicationLifetime? Lifetime;
+
+    internal static BridgeHost? Current => Starting.Value;
+
+    internal static nint Init(string assembly, string contentRoot, string environment, Dictionary<string, string> config)
+    {
+        var host = new BridgeHost();
+        lock (Gate)
+        {
             try
             {
-                var asm = Assembly.LoadFrom(assembly);
+                if (!_registered)
+                {
+                    AppContext.SetData(CaddyServerRegistration.AppContextKey,
+                        new Action<IHostBuilder>(CaddyServerRegistration.Configure));
+                    _registered = true;
+                }
+                host._loadContext = new AppLoadContext(assembly);
+                var asm = host._loadContext.LoadFromAssemblyPath(assembly);
                 var entry = asm.EntryPoint ?? asm.GetTypes()
-                        .SelectMany(t =>
-                            t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static |
-                                         BindingFlags.DeclaredOnly)).FirstOrDefault(m =>
-                            m.Name == "Main" && m.GetParameters() is var p && (p.Length == 0 ||
-                                                                               p.Length == 1 && p[0].ParameterType ==
-                                                                               typeof(string[])))
-                    ?? throw new InvalidOperationException(
-                        $"No static Main entry point was found in '{assembly}'.");
+                    .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static |
+                                                   BindingFlags.DeclaredOnly))
+                    .FirstOrDefault(m => m.Name == "Main" && m.GetParameters() is var p &&
+                                         (p.Length == 0 || p.Length == 1 && p[0].ParameterType == typeof(string[])))
+                    ?? throw new InvalidOperationException($"No static Main entry point was found in '{assembly}'.");
                 Environment.SetEnvironmentVariable("ASPNETCORE_APPLICATIONNAME", asm.GetName().Name);
                 Environment.SetEnvironmentVariable("ASPNETCORE_CONTENTROOT", contentRoot);
                 Environment.SetEnvironmentVariable("ASPNETCORE_ENVIRONMENT", environment);
                 foreach (var pair in config) Environment.SetEnvironmentVariable(pair.Key, pair.Value);
-                AppContext.SetData(CaddyServerRegistration.AppContextKey,
-                    new Action<IHostBuilder>(CaddyServerRegistration.Configure));
-                EntryPointTask = Task.Run(async () =>
+                Starting.Value = host;
+                host._entryPointTask = Task.Run(async () =>
                 {
                     try
                     {
@@ -55,46 +71,72 @@ internal static class BridgeHost
                         throw ex.InnerException ?? ex;
                     }
                 });
-                Task.WhenAny(ServerStarted.Task, EntryPointTask).GetAwaiter().GetResult();
-                if (ServerStarted.Task.IsCompletedSuccessfully is false)
-                    throw EntryPointTask.Exception?.GetBaseException() ??
+                Task.WhenAny(host._serverStarted.Task, host._entryPointTask).GetAwaiter().GetResult();
+                if (!host._serverStarted.Task.IsCompletedSuccessfully)
+                    throw host._entryPointTask.Exception?.GetBaseException() ??
                           new InvalidOperationException("Application entry point exited before its server started.");
-                Signature = signature;
-                return 0;
+                var id = (nint)Interlocked.Increment(ref _nextId);
+                Hosts.Add(id, host);
+                return id;
             }
             catch (Exception ex)
             {
-                AppContext.SetData(CaddyServerRegistration.AppContextKey, null);
                 Console.Error.WriteLine(ex);
-                return -1;
+                host.Lifetime?.StopApplication();
+                try { host._entryPointTask?.Wait(TimeSpan.FromSeconds(30)); }
+                catch (Exception stopError) { Console.Error.WriteLine(stopError); }
+                host._entryPointTask = null;
+                host.Server = null;
+                host.Lifetime = null;
+                host._loadContext?.Unload();
+                host._loadContext = null;
+                return 0;
+            }
+            finally
+            {
+                Starting.Value = null;
             }
         }
     }
 
-    internal static int Shutdown()
+    internal static BridgeHost Get(nint id)
     {
-        lock (typeof(BridgeHost))
-        {
-            if (EntryPointTask == null) return 0;
-            try
-            {
-                Lifetime?.StopApplication();
-                EntryPointTask.Wait(TimeSpan.FromSeconds(30));
-                EntryPointTask = null;
-                Server = null;
-                Lifetime = null;
-                AppContext.SetData(CaddyServerRegistration.AppContextKey, null);
-                return 0;
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine(ex);
-                return -1;
-            }
-        }
+        lock (Gate) return Hosts[id];
     }
 
-    internal static RequestState Start(
+    internal static int Shutdown(nint id)
+    {
+        BridgeHost host;
+        lock (Gate)
+        {
+            if (!Hosts.TryGetValue(id, out host!)) return -1;
+        }
+        try
+        {
+            host.Lifetime?.StopApplication();
+            if (host._entryPointTask?.Wait(TimeSpan.FromSeconds(30)) == false) return -1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex);
+            return -1;
+        }
+        lock (Gate) Hosts.Remove(id);
+        host._entryPointTask = null;
+        host.Server = null;
+        host.Lifetime = null;
+        host._loadContext?.Unload();
+        host._loadContext = null;
+        return 0;
+    }
+
+    internal void Started(CaddyServer server)
+    {
+        Server = server;
+        _serverStarted.TrySetResult();
+    }
+
+    internal RequestState Start(
         string method,
         string scheme, 
         string host,

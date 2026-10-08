@@ -17,13 +17,18 @@ CADDY=ROOT/'bin/caddysharp'
 PORT=18080
 ADMIN=12019
 
-def req(path, method='GET', body=None, headers=None):
- c=http.client.HTTPConnection('127.0.0.1', PORT, timeout=15)
+def req(path, method='GET', body=None, headers=None, port=PORT):
+ c=http.client.HTTPConnection('127.0.0.1', port, timeout=15)
  c.request(method,path,body=body,headers=headers or {})
  r=c.getresponse(); data=r.read(); result=(r.status,data,r.getheaders()); c.close(); return result
 
 def main():
  config=subprocess.check_output(['python3',str(ROOT/'scripts/caddyfile.py'),'--port',str(PORT),'--admin-port',str(ADMIN)],text=True)
+ # Run two independent instances of the same assembly with different configuration.
+ app_body=config.split('  app sample {',1)[1].split('  }\n }\n}',1)[0]
+ second='  app second {'+app_body.replace('example','second')+'  }\n'
+ config=config.replace(' }\n}\nhttp',second+' }\n}\nhttp',1)
+ config+=f'\nhttp://127.0.0.1:{PORT+1} {{\n aspnetcore second\n}}\n'
  with tempfile.TemporaryDirectory() as td:
   path=Path(td)/'Caddyfile';path.write_text(config)
   p=subprocess.Popen([str(CADDY),'run','--config',str(path)],cwd=ROOT,stdout=subprocess.DEVNULL,stderr=(Path(td)/'caddy.log').open('w'))
@@ -34,6 +39,12 @@ def main():
     except Exception:time.sleep(.1)
    else:raise AssertionError('Caddy did not start: '+(Path(td)/'caddy.log').read_text())
    assert req('/text')[:2]==(200,b'hello caddysharp')
+   for _ in range(80):
+    try:
+     if req('/config',port=PORT+1)[0]==200:break
+    except Exception:time.sleep(.1)
+   else:raise AssertionError('second app did not start')
+   assert json.loads(req('/config',port=PORT+1)[1])['value']=='second'
    assert json.loads(req('/json')[1])['ok']
    assert req('/echo','POST',bytes(range(256)))[1]==bytes(range(256))
    for size in (0, 1024, 65536, 1024*1024):
@@ -92,9 +103,10 @@ def main():
    assert json.loads(req('/startup-count')[1])==1
    altered=Path(td)/'Changed.Caddyfile';altered.write_text(config.replace('example','changed'))
    changed=subprocess.check_output([str(CADDY),'adapt','--config',str(altered)],stderr=subprocess.DEVNULL)
-   try:urllib.request.urlopen(urllib.request.Request(f'http://localhost:{ADMIN}/load',data=changed,headers={'Content-Type':'application/json'}),timeout=5);raise AssertionError('incompatible reload accepted')
-   except urllib.error.HTTPError as ex:assert ex.code>=400
-   assert req('/text')[1]==b'hello caddysharp'
+   urllib.request.urlopen(urllib.request.Request(f'http://localhost:{ADMIN}/load',data=changed,headers={'Content-Type':'application/json'}),timeout=10).read()
+   assert json.loads(req('/config')[1])['value']=='changed'
+   assert json.loads(req('/config',port=PORT+1)[1])['value']=='second'
+   assert json.loads(req('/startup-count',port=PORT+1)[1])==1
    print('integration: PASS; PID',pid)
   finally:
    try:urllib.request.urlopen(urllib.request.Request(f'http://localhost:{ADMIN}/stop',data=b'',method='POST'),timeout=5).read()

@@ -10,10 +10,13 @@ internal static class CaddyServerRegistration
 
     internal static void Configure(IHostBuilder builder)
     {
+        var host = BridgeHost.Current;
+        if (host is null) return;
         builder.ConfigureServices((_, services) =>
         {
+            services.AddSingleton(host);
             services.AddSingleton<IHostLifetime, CaddyHostLifetime>();
-            services.AddSingleton<CaddyServer>();
+            services.AddSingleton(new CaddyServer(host));
             services.AddSingleton<IServer>(provider => provider.GetRequiredService<CaddyServer>());
         });
     }

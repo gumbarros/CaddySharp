@@ -32,7 +32,7 @@ public static unsafe class Exports
     [DNNE.C99DeclCode(
         "typedef struct { unsigned char* data; int32_t length; } cs_bytes; typedef struct { cs_bytes name; cs_bytes value; } cs_header;")]
     [UnmanagedCallersOnly(EntryPoint = "caddysharp_init")]
-    public static int Init([DNNE.C99Type("cs_bytes")] AbiBytes assembly, [DNNE.C99Type("cs_bytes")] AbiBytes root,
+    public static nint Init([DNNE.C99Type("cs_bytes")] AbiBytes assembly, [DNNE.C99Type("cs_bytes")] AbiBytes root,
         [DNNE.C99Type("cs_bytes")] AbiBytes environment, [DNNE.C99Type("cs_header*")] AbiHeader* config, int count)
     {
         try
@@ -44,12 +44,12 @@ public static unsafe class Exports
         catch (Exception ex)
         {
             Console.Error.WriteLine(ex);
-            return -1;
+            return 0;
         }
     }
 
     [UnmanagedCallersOnly(EntryPoint = "caddysharp_start")]
-    public static nint Start([DNNE.C99Type("cs_bytes")] AbiBytes method, [DNNE.C99Type("cs_bytes")] AbiBytes scheme,
+    public static nint Start(nint app, [DNNE.C99Type("cs_bytes")] AbiBytes method, [DNNE.C99Type("cs_bytes")] AbiBytes scheme,
         [DNNE.C99Type("cs_bytes")] AbiBytes host, [DNNE.C99Type("cs_bytes")] AbiBytes path,
         [DNNE.C99Type("cs_bytes")] AbiBytes rawTarget, [DNNE.C99Type("cs_bytes")] AbiBytes query,
         [DNNE.C99Type("cs_bytes")] AbiBytes remote,
@@ -65,7 +65,7 @@ public static unsafe class Exports
                 list.Add(S(headers[i].Value));
             }
 
-            var state = BridgeHost.Start(S(method), S(scheme), S(host), S(path), S(rawTarget), S(query), S(remote),
+            var state = BridgeHost.Get(app).Start(S(method), S(scheme), S(host), S(path), S(rawTarget), S(query), S(remote),
                 values, maxResponse);
             return GCHandle.ToIntPtr(GCHandle.Alloc(state));
         }
@@ -275,7 +275,7 @@ public static unsafe class Exports
     }
 
     [UnmanagedCallersOnly(EntryPoint = "caddysharp_shutdown")]
-    public static int Shutdown() => BridgeHost.Shutdown();
+    public static int Shutdown(nint app) => BridgeHost.Shutdown(app);
 
     [UnmanagedCallersOnly(EntryPoint = "caddysharp_free")]
     public static void Free(nint handle)

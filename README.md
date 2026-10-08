@@ -60,6 +60,8 @@ builder.Host.UseCaddyServer();
 
 Then point the `assembly` and `content_root` settings in the generated Caddyfile at your app. The `native_library` and `runtime_config` settings point at the bridge build; `runtime_config` must be the file next to the native library. See [the sample app](src/CaddySharp.Sample/Program.cs) and [the Caddyfile generator](scripts/caddyfile.py). The bridge calls your app's normal `Main` method. `UseCaddyServer()` has no effect when the app runs directly, so direct runs still use Kestrel.
 
+To host several apps, add an `app name { ... }` block for each one under `aspnetcore`, then use `aspnetcore name` in each site route. Reloading the Caddyfile can replace an app configuration without restarting the process. All app blocks must reference the same `native_library` and `runtime_config`.
+
 ## Benchmark
 
 **In the latest local run, CaddySharp beat Caddy → Kestrel for all three sample endpoints at 16 clients.** These are median values from three 2-second measurements after a 2-second warm-up, on an Intel Core 7 150U Linux workstation:
@@ -84,7 +86,6 @@ The script compares direct Kestrel, Caddy → Kestrel, a buffered proxy, and Cad
 
 - **Body limits:** the sample caps requests at 1 MiB, returning 413 for oversized uploads. Responses are unlimited by default. Set `max_request_body` or `max_response_body` in the Caddyfile to a size such as `4MB`, or to `unlimited`. A response limit exceeded after headers are sent closes the partial response.
 - **Upgraded and long-lived protocols:** no WebSockets, SignalR, or gRPC support.
-- **Multiple apps and runtime replacement:** exactly one app is supported per process. A config reload can reuse that app, but changing the app or runtime requires a process restart. CoreCLR is not unloaded.
 - **Broad platform and deployment support:** only Linux x64, .NET 10, and framework-dependent deployment have been targeted.
 - **Production validation:** sustained mixed-runtime load needed scheduler safeguards (`GOMAXPROCS=1`, Go asynchronous preemption disabled, and at most 32 simultaneous ABI waits). Longer stability tests, profiling, and wider workload benchmarks are still needed.
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,8 +36,10 @@ type AppConfig struct {
 }
 type App struct {
 	Apps      map[string]AppConfig `json:"apps"`
-	signature string
+	handles   map[string]uintptr
 	active    sync.WaitGroup
+	requestMu sync.Mutex
+	stopping  bool
 	pending   atomic.Int64
 	ready     chan struct{}
 	slots     chan struct{}
@@ -47,11 +50,21 @@ type Handler struct {
 	app  *App
 }
 
+type runningApp struct {
+	handle uintptr
+	refs   int
+}
+
 var global struct {
 	sync.Mutex
-	signature string
-	started   bool
-	refs      int
+	library string
+	runtime string
+	apps    map[string]*runningApp
+}
+
+func appKey(v AppConfig) string {
+	data, _ := json.Marshal(v)
+	return string(data)
 }
 
 func init() {
@@ -191,8 +204,8 @@ func (a *App) Provision(ctx caddy.Context) error {
 	// thread while CoreCLR processes it, and excessive cgo waiters can exhaust
 	// the mixed runtime's scheduler under sustained load.
 	a.slots = make(chan struct{}, 32)
-	if len(a.Apps) != 1 {
-		return fmt.Errorf("exactly one aspnetcore app is supported")
+	if len(a.Apps) == 0 {
+		return fmt.Errorf("at least one aspnetcore app is required")
 	}
 	for _, v := range a.Apps {
 		for key, path := range map[string]string{"assembly": v.Assembly, "runtime_config": v.RuntimeConfig, "native_library": v.NativeLibrary, "content_root": v.ContentRoot} {
@@ -225,60 +238,112 @@ func (a *App) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("runtime_config must point to the DNNE adjacent runtimeconfig %s", expected)
 		}
 	}
-	bytes, _ := json.Marshal(a.Apps)
-	a.signature = string(bytes)
 	return nil
 }
 func (a *App) Start() (err error) {
 	defer func() { a.startErr = err; close(a.ready) }()
-	// Keep the mixed Go/CoreCLR process on the validated scheduler setting,
-	// including when this module is used from a custom Caddy launcher.
 	runtime.GOMAXPROCS(1)
 	global.Lock()
 	defer global.Unlock()
-	if global.started {
-		if global.signature != a.signature {
-			return fmt.Errorf("ASP.NET runtime/app changed; restart Caddy")
-		}
-		global.refs++
-		return nil
+	if global.apps == nil {
+		global.apps = make(map[string]*runningApp)
 	}
-	for _, v := range a.Apps {
-		if e := loadNative(v.NativeLibrary); e != nil {
+	a.handles = make(map[string]uintptr)
+	names := make([]string, 0, len(a.Apps))
+	for name := range a.Apps {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	acquired := make([]string, 0, len(names))
+	defer func() {
+		if err == nil {
+			return
+		}
+		for _, key := range acquired {
+			entry := global.apps[key]
+			entry.refs--
+			if entry.refs == 0 {
+				_ = shutdownNative(entry.handle)
+				delete(global.apps, key)
+			}
+		}
+	}()
+	for _, name := range names {
+		cfg := a.Apps[name]
+		library, e := filepath.EvalSymlinks(cfg.NativeLibrary)
+		if e != nil {
 			return e
 		}
-		env := make([]header, 0, len(v.Env))
-		for k, value := range v.Env {
-			env = append(env, header{k, value})
-		}
-		if e := initNative(v.Assembly, v.ContentRoot, v.Environment, env); e != nil {
+		runtimeConfig, e := filepath.EvalSymlinks(cfg.RuntimeConfig)
+		if e != nil {
 			return e
 		}
+		if global.library != "" && (global.library != library || global.runtime != runtimeConfig) {
+			return fmt.Errorf("CoreCLR runtime or native bridge changed; restart Caddy")
+		}
+		if global.library == "" {
+			if e = loadNative(library); e != nil {
+				return e
+			}
+			global.library, global.runtime = library, runtimeConfig
+		}
+		key := appKey(cfg)
+		entry := global.apps[key]
+		if entry == nil {
+			env := make([]header, 0, len(cfg.Env))
+			for k, value := range cfg.Env {
+				env = append(env, header{k, value})
+			}
+			handle, e := initNative(cfg.Assembly, cfg.ContentRoot, cfg.Environment, env)
+			if e != nil {
+				return e
+			}
+			entry = &runningApp{handle: handle}
+			global.apps[key] = entry
+		}
+		entry.refs++
+		acquired = append(acquired, key)
+		a.handles[name] = entry.handle
 	}
-	global.signature = a.signature
-	global.started = true
-	global.refs = 1
 	return nil
 }
 func (a *App) Stop() error {
-	for _, v := range a.Apps {
-		duration, _ := time.ParseDuration(v.ShutdownTimeout)
-		done := make(chan struct{})
-		go func() { a.active.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(duration):
-			return fmt.Errorf("aspnetcore shutdown timed out")
+	if a.startErr != nil || a.handles == nil {
+		return nil
+	}
+	a.requestMu.Lock()
+	a.stopping = true
+	a.requestMu.Unlock()
+	maxWait := time.Duration(0)
+	for _, cfg := range a.Apps {
+		duration, _ := time.ParseDuration(cfg.ShutdownTimeout)
+		if duration > maxWait {
+			maxWait = duration
 		}
+	}
+	done := make(chan struct{})
+	go func() { a.active.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(maxWait):
+		return fmt.Errorf("aspnetcore shutdown timed out")
 	}
 	global.Lock()
 	defer global.Unlock()
-	global.refs--
-	if global.refs == 0 {
-		log.Printf("caddysharp pending_handles=%d", a.pending.Load())
-		return shutdownNative()
+	var first error
+	for _, cfg := range a.Apps {
+		key := appKey(cfg)
+		entry := global.apps[key]
+		entry.refs--
+		if entry.refs == 0 {
+			log.Printf("caddysharp pending_handles=%d", a.pending.Load())
+			if e := shutdownNative(entry.handle); e != nil && first == nil {
+				first = e
+			}
+			delete(global.apps, key)
+		}
 	}
-	return nil
+	return first
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	select {
@@ -318,12 +383,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return r.Context().Err()
 	}
 	defer func() { <-h.app.slots }()
-	handle, e := requestNative(r.Method, scheme, r.Host, path, r.RequestURI, query, r.RemoteAddr, hs, cfg.MaxResponseBody)
+	h.app.requestMu.Lock()
+	if h.app.stopping {
+		h.app.requestMu.Unlock()
+		return fmt.Errorf("aspnetcore app is stopping")
+	}
+	h.app.active.Add(1)
+	h.app.requestMu.Unlock()
+	handle, e := requestNative(h.app.handles[h.Name], r.Method, scheme, r.Host, path, r.RequestURI, query, r.RemoteAddr, hs, cfg.MaxResponseBody)
 	if e != nil {
+		h.app.active.Done()
 		http.Error(w, "internal server error", 500)
 		return e
 	}
-	h.app.active.Add(1)
 	h.app.pending.Add(1)
 	inputDone := make(chan error, 1)
 	var inputFinished atomic.Bool

@@ -11,8 +11,8 @@ typedef struct { cs_bytes name; cs_bytes value; } cs_header;
 static void* library;
 static int (*preload)(void);
 static int32_t (*probe)(void);
-static int32_t (*init_app)(cs_bytes,cs_bytes,cs_bytes,cs_header*,int32_t);
-static intptr_t (*start)(cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_header*,int32_t,int64_t);
+static intptr_t (*init_app)(cs_bytes,cs_bytes,cs_bytes,cs_header*,int32_t);
+static intptr_t (*start)(intptr_t,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_header*,int32_t,int64_t);
 static int32_t (*wait_request)(intptr_t);
 static int32_t (*is_completed)(intptr_t);
 static void (*cancel_request)(intptr_t);
@@ -26,7 +26,7 @@ static int32_t (*header_count)(intptr_t);
 static int32_t (*copy_header)(intptr_t,int32_t,unsigned char*,int32_t,unsigned char*,int32_t);
 static void (*free_request)(intptr_t);
 static int32_t (*complete_request)(intptr_t);
-static int32_t (*shutdown_app)(void);
+static int32_t (*shutdown_app)(intptr_t);
 static int load_native(const char* path) {
  if (library) return 0;
  library=dlopen(path,RTLD_NOW|RTLD_LOCAL);
@@ -40,8 +40,8 @@ static int load_native(const char* path) {
 }
 static int do_preload(void) { return preload(); }
 static int do_probe(void) { return probe(); }
-static int do_init(cs_bytes a,cs_bytes r,cs_bytes e,cs_header* h,int n) { return init_app(a,r,e,h,n); }
-static intptr_t do_start(cs_bytes m,cs_bytes s,cs_bytes h,cs_bytes p,cs_bytes raw,cs_bytes q,cs_bytes r,cs_header* hs,int n,int64_t max) { return start(m,s,h,p,raw,q,r,hs,n,max); }
+static intptr_t do_init(cs_bytes a,cs_bytes r,cs_bytes e,cs_header* h,int n) { return init_app(a,r,e,h,n); }
+static intptr_t do_start(intptr_t app,cs_bytes m,cs_bytes s,cs_bytes h,cs_bytes p,cs_bytes raw,cs_bytes q,cs_bytes r,cs_header* hs,int n,int64_t max) { return start(app,m,s,h,p,raw,q,r,hs,n,max); }
 static int do_wait(intptr_t h) { return wait_request(h); }
 static int do_is_completed(intptr_t h) { return is_completed(h); }
 static void do_cancel(intptr_t h) { cancel_request(h); }
@@ -55,7 +55,7 @@ static int do_header_count(intptr_t h) { return header_count(h); }
 static int do_copy_header(intptr_t h,int i,unsigned char* n,int nc,unsigned char* v,int vc) { return copy_header(h,i,n,nc,v,vc); }
 static void do_free(intptr_t h) { free_request(h); }
 static int do_complete(intptr_t h) { return complete_request(h); }
-static int do_shutdown(void) { return shutdown_app(); }
+static int do_shutdown(intptr_t app) { return shutdown_app(app); }
 static const char* native_error(void) { return dlerror(); }
 */
 import "C"
@@ -109,7 +109,7 @@ func loadNative(path string) error {
 	}
 	return nil
 }
-func initNative(assembly, root, environment string, config []header) error {
+func initNative(assembly, root, environment string, config []header) (uintptr, error) {
 	a, r, e := nativeBytes([]byte(assembly)), nativeBytes([]byte(root)), nativeBytes([]byte(environment))
 	defer releaseBytes(a)
 	defer releaseBytes(r)
@@ -117,11 +117,11 @@ func initNative(assembly, root, environment string, config []header) error {
 	hs, done := nativeHeaders(config)
 	defer done()
 	if rc := C.do_init(a, r, e, hs, C.int(len(config))); rc != 0 {
-		return fmt.Errorf("managed init: %d", int(rc))
+		return uintptr(rc), nil
 	}
-	return nil
+	return 0, fmt.Errorf("managed init failed")
 }
-func requestNative(method, scheme, host, path, rawTarget, query, remote string, headers []header, max int64) (C.intptr_t, error) {
+func requestNative(app uintptr, method, scheme, host, path, rawTarget, query, remote string, headers []header, max int64) (C.intptr_t, error) {
 	fields := []C.cs_bytes{nativeBytes([]byte(method)), nativeBytes([]byte(scheme)), nativeBytes([]byte(host)), nativeBytes([]byte(path)), nativeBytes([]byte(rawTarget)), nativeBytes([]byte(query)), nativeBytes([]byte(remote))}
 	defer func() {
 		for _, b := range fields {
@@ -130,7 +130,7 @@ func requestNative(method, scheme, host, path, rawTarget, query, remote string, 
 	}()
 	hs, done := nativeHeaders(headers)
 	defer done()
-	h := C.do_start(fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], hs, C.int(len(headers)), C.int64_t(max))
+	h := C.do_start(C.intptr_t(app), fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], hs, C.int(len(headers)), C.int64_t(max))
 	if h == 0 {
 		return 0, fmt.Errorf("managed start failed")
 	}
@@ -171,8 +171,8 @@ func completeNative(h C.intptr_t) error {
 	}
 	return nil
 }
-func shutdownNative() error {
-	if C.do_shutdown() != 0 {
+func shutdownNative(app uintptr) error {
+	if C.do_shutdown(C.intptr_t(app)) != 0 {
 		return fmt.Errorf("managed shutdown failed")
 	}
 	return nil
