@@ -11,7 +11,7 @@ Run an ASP.NET Core app inside a Caddy process. Caddy accepts the HTTP request a
 Caddy already handles the public HTTP connection. CaddySharp tests whether it can also host the ASP.NET Core pipeline in the same process, removing the local Caddy → Kestrel hop.
 The sample uses a normal Minimal API, dependency injection, and configuration. One host extension selects CaddySharp's server when Caddy launches the app.
 
-The current implementation is useful for experimenting with this architecture and measuring its costs. It buffers request and response bodies, so it is a poor fit for streaming workloads.
+The bridge streams request and response bodies through bounded pipes. ASP.NET Core can read an upload before it finishes and send response chunks as they are written.
 
 ## Get started
 
@@ -82,7 +82,7 @@ The script compares direct Kestrel, Caddy → Kestrel, a buffered proxy, and Cad
 
 ## What's missing
 
-- **Streaming:** request and response bodies are fully buffered. There is no SSE or unbounded streaming support. The sample configuration caps requests at 1 MiB and responses at 4 MiB; oversized requests get 413 and oversized responses get 500.
+- **Body limits:** the sample caps requests at 1 MiB, returning 413 for oversized uploads. Responses are unlimited by default. Set `max_request_body` or `max_response_body` in the Caddyfile to a size such as `4MB`, or to `unlimited`. A response limit exceeded after headers are sent closes the partial response.
 - **Upgraded and long-lived protocols:** no WebSockets, SignalR, or gRPC support.
 - **Multiple apps and runtime replacement:** exactly one app is supported per process. A config reload can reuse that app, but changing the app or runtime requires a process restart. CoreCLR is not unloaded.
 - **Broad platform and deployment support:** only Linux x64, .NET 10, and framework-dependent deployment have been targeted.

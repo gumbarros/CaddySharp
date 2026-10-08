@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -51,7 +52,7 @@ public static unsafe class Exports
     public static nint Start([DNNE.C99Type("cs_bytes")] AbiBytes method, [DNNE.C99Type("cs_bytes")] AbiBytes scheme,
         [DNNE.C99Type("cs_bytes")] AbiBytes host, [DNNE.C99Type("cs_bytes")] AbiBytes path,
         [DNNE.C99Type("cs_bytes")] AbiBytes rawTarget, [DNNE.C99Type("cs_bytes")] AbiBytes query,
-        [DNNE.C99Type("cs_bytes")] AbiBytes remote, [DNNE.C99Type("cs_bytes")] AbiBytes body,
+        [DNNE.C99Type("cs_bytes")] AbiBytes remote,
         [DNNE.C99Type("cs_header*")] AbiHeader* headers, int count, long maxResponse)
     {
         try
@@ -64,10 +65,8 @@ public static unsafe class Exports
                 list.Add(S(headers[i].Value));
             }
 
-            var bytes = new byte[body.Length];
-            if (body.Length > 0) Marshal.Copy((nint)body.Data, bytes, 0, body.Length);
             var state = BridgeHost.Start(S(method), S(scheme), S(host), S(path), S(rawTarget), S(query), S(remote),
-                bytes, values, maxResponse);
+                values, maxResponse);
             return GCHandle.ToIntPtr(GCHandle.Alloc(state));
         }
         catch (Exception ex)
@@ -122,23 +121,66 @@ public static unsafe class Exports
         }
     }
 
+    [UnmanagedCallersOnly(EntryPoint = "caddysharp_request_write")]
+    public static int RequestWrite(nint handle, byte* source, int length)
+    {
+        try
+        {
+            var state = State(handle);
+            var bytes = new byte[length];
+            Marshal.Copy((nint)source, bytes, 0, length);
+            state.Input.Writer.WriteAsync(bytes, state.Cancellation.Token).AsTask().GetAwaiter().GetResult();
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex);
+            return -1;
+        }
+    }
+
+    [UnmanagedCallersOnly(EntryPoint = "caddysharp_request_end")]
+    public static void RequestEnd(nint handle)
+    {
+        try { State(handle).Input.Writer.Complete(); }
+        catch (Exception ex) { Console.Error.WriteLine(ex); }
+    }
+
+    // 0: pending; 1: headers available; 2: request finished without a response.
+    [UnmanagedCallersOnly(EntryPoint = "caddysharp_response_state")]
+    public static int ResponseState(nint handle)
+    {
+        var state = State(handle);
+        return state.Started ? 1 : state.Task?.IsCompleted == true ? 2 : 0;
+    }
+
+    // 0: no chunk yet; -1: end of stream; positive: copied bytes.
+    [UnmanagedCallersOnly(EntryPoint = "caddysharp_response_read")]
+    public static int ResponseRead(nint handle, byte* target, int capacity)
+    {
+        try
+        {
+            var reader = State(handle).Output.Reader;
+            if (!reader.TryRead(out var result)) return 0;
+            var count = (int)Math.Min(result.Buffer.Length, capacity);
+            if (count > 0)
+            {
+                result.Buffer.Slice(0, count).CopyTo(new Span<byte>(target, count));
+                reader.AdvanceTo(result.Buffer.GetPosition(count));
+                return count;
+            }
+            reader.AdvanceTo(result.Buffer.End);
+            return result.IsCompleted ? -1 : 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex);
+            return -2;
+        }
+    }
+
     [UnmanagedCallersOnly(EntryPoint = "caddysharp_status")]
     public static int Status(nint handle) => State(handle).Status;
-
-    [UnmanagedCallersOnly(EntryPoint = "caddysharp_body_length")]
-    public static int BodyLength(nint handle) => checked((int)State(handle).Output.Length);
-
-    [UnmanagedCallersOnly(EntryPoint = "caddysharp_copy_body")]
-    public static int CopyBody(nint handle, byte* target, int capacity)
-    {
-        var output = State(handle).Output;
-        var length = checked((int)output.Length);
-        if (capacity < length) return -1;
-        if (length == 0) return 0;
-        if (!output.TryGetBuffer(out var segment)) return -1;
-        Marshal.Copy(segment.Array!, segment.Offset, (nint)target, length);
-        return length;
-    }
 
     // Additive ABI v1 export. A null destination queries the exact byte count.
     // The completed response is immutable until Complete/Free; no managed pointer escapes.
@@ -244,7 +286,8 @@ public static unsafe class Exports
             var state = (RequestState)gc.Target!;
             if (state.Task?.IsCompleted != true) return;
             state.Cancellation.Dispose();
-            state.Output.Dispose();
+            state.Input.Reader.Complete();
+            state.Output.Reader.Complete();
             gc.Free();
         }
         catch (Exception ex)

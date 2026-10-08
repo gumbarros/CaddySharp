@@ -102,7 +102,6 @@ internal static class BridgeHost
         string rawTarget,
         string query, 
         string remote, 
-        byte[] body, //todo here the body is entirely loaded at memory.
         Dictionary<string, List<string>> headers,
         long maxResponse)
     {
@@ -110,7 +109,7 @@ internal static class BridgeHost
         var request = new HttpRequestFeature
         {
             Method = method, Scheme = scheme, Path = path, PathBase = "", QueryString = query, RawTarget = rawTarget,
-            Protocol = "HTTP/1.1", Headers = new HeaderDictionary(), Body = new MemoryStream(body, false)
+            Protocol = "HTTP/1.1", Headers = new HeaderDictionary(), Body = state.Input.Reader.AsStream()
         };
         request.Headers.Host = host;
         foreach (var pair in headers) request.Headers[pair.Key] = new StringValues(pair.Value.ToArray());
@@ -133,9 +132,14 @@ internal static class BridgeHost
             {
                 state.Error = ex;
                 Console.Error.WriteLine(ex);
-                state.Status = 500;
-                state.Headers.Clear();
-                state.Output.SetLength(0);
+                if (!state.Started)
+                {
+                    state.Status = 500;
+                    state.Headers.Clear();
+                    state.Started = true;
+                }
+                await state.Output.Writer.CompleteAsync(ex);
+                state.Finished = true;
             }
         });
         return state;

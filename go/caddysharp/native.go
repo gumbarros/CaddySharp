@@ -12,13 +12,15 @@ static void* library;
 static int (*preload)(void);
 static int32_t (*probe)(void);
 static int32_t (*init_app)(cs_bytes,cs_bytes,cs_bytes,cs_header*,int32_t);
-static intptr_t (*start)(cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_header*,int32_t,int64_t);
+static intptr_t (*start)(cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_bytes,cs_header*,int32_t,int64_t);
 static int32_t (*wait_request)(intptr_t);
 static int32_t (*is_completed)(intptr_t);
 static void (*cancel_request)(intptr_t);
+static int32_t (*request_write)(intptr_t,unsigned char*,int32_t);
+static void (*request_end)(intptr_t);
+static int32_t (*response_state)(intptr_t);
+static int32_t (*response_read)(intptr_t,unsigned char*,int32_t);
 static int32_t (*status)(intptr_t);
-static int32_t (*body_length)(intptr_t);
-static int32_t (*copy_body)(intptr_t,unsigned char*,int32_t);
 static int32_t (*copy_headers)(intptr_t,unsigned char*,int32_t);
 static int32_t (*header_count)(intptr_t);
 static int32_t (*copy_header)(intptr_t,int32_t,unsigned char*,int32_t,unsigned char*,int32_t);
@@ -32,20 +34,22 @@ static int load_native(const char* path) {
  #define GET(v,n) v=dlsym(library,n); if (!v) return -2;
  GET(preload,"try_preload_runtime") GET(probe,"caddysharp_probe") GET(init_app,"caddysharp_init")
  GET(start,"caddysharp_start") GET(wait_request,"caddysharp_wait") GET(is_completed,"caddysharp_is_completed") GET(cancel_request,"caddysharp_cancel")
- GET(status,"caddysharp_status") GET(body_length,"caddysharp_body_length") GET(copy_body,"caddysharp_copy_body")
+ GET(request_write,"caddysharp_request_write") GET(request_end,"caddysharp_request_end") GET(response_state,"caddysharp_response_state") GET(response_read,"caddysharp_response_read") GET(status,"caddysharp_status")
  GET(copy_headers,"caddysharp_copy_headers") GET(header_count,"caddysharp_header_count") GET(copy_header,"caddysharp_copy_header") GET(free_request,"caddysharp_free") GET(complete_request,"caddysharp_complete") GET(shutdown_app,"caddysharp_shutdown")
  return 0;
 }
 static int do_preload(void) { return preload(); }
 static int do_probe(void) { return probe(); }
 static int do_init(cs_bytes a,cs_bytes r,cs_bytes e,cs_header* h,int n) { return init_app(a,r,e,h,n); }
-static intptr_t do_start(cs_bytes m,cs_bytes s,cs_bytes h,cs_bytes p,cs_bytes raw,cs_bytes q,cs_bytes r,cs_bytes b,cs_header* hs,int n,int64_t max) { return start(m,s,h,p,raw,q,r,b,hs,n,max); }
+static intptr_t do_start(cs_bytes m,cs_bytes s,cs_bytes h,cs_bytes p,cs_bytes raw,cs_bytes q,cs_bytes r,cs_header* hs,int n,int64_t max) { return start(m,s,h,p,raw,q,r,hs,n,max); }
 static int do_wait(intptr_t h) { return wait_request(h); }
 static int do_is_completed(intptr_t h) { return is_completed(h); }
 static void do_cancel(intptr_t h) { cancel_request(h); }
+static int do_request_write(intptr_t h,unsigned char* b,int n) { return request_write(h,b,n); }
+static void do_request_end(intptr_t h) { request_end(h); }
+static int do_response_state(intptr_t h) { return response_state(h); }
+static int do_response_read(intptr_t h,unsigned char* b,int n) { return response_read(h,b,n); }
 static int do_status(intptr_t h) { return status(h); }
-static int do_body_length(intptr_t h) { return body_length(h); }
-static int do_copy_body(intptr_t h,unsigned char* b,int n) { return copy_body(h,b,n); }
 static int do_copy_headers(intptr_t h,unsigned char* b,int n) { return copy_headers(h,b,n); }
 static int do_header_count(intptr_t h) { return header_count(h); }
 static int do_copy_header(intptr_t h,int i,unsigned char* n,int nc,unsigned char* v,int vc) { return copy_header(h,i,n,nc,v,vc); }
@@ -117,8 +121,8 @@ func initNative(assembly, root, environment string, config []header) error {
 	}
 	return nil
 }
-func requestNative(method, scheme, host, path, rawTarget, query, remote string, body []byte, headers []header, max int64) (C.intptr_t, error) {
-	fields := []C.cs_bytes{nativeBytes([]byte(method)), nativeBytes([]byte(scheme)), nativeBytes([]byte(host)), nativeBytes([]byte(path)), nativeBytes([]byte(rawTarget)), nativeBytes([]byte(query)), nativeBytes([]byte(remote)), nativeBytes(body)}
+func requestNative(method, scheme, host, path, rawTarget, query, remote string, headers []header, max int64) (C.intptr_t, error) {
+	fields := []C.cs_bytes{nativeBytes([]byte(method)), nativeBytes([]byte(scheme)), nativeBytes([]byte(host)), nativeBytes([]byte(path)), nativeBytes([]byte(rawTarget)), nativeBytes([]byte(query)), nativeBytes([]byte(remote))}
 	defer func() {
 		for _, b := range fields {
 			releaseBytes(b)
@@ -126,7 +130,7 @@ func requestNative(method, scheme, host, path, rawTarget, query, remote string, 
 	}()
 	hs, done := nativeHeaders(headers)
 	defer done()
-	h := C.do_start(fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7], hs, C.int(len(headers)), C.int64_t(max))
+	h := C.do_start(fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], hs, C.int(len(headers)), C.int64_t(max))
 	if h == 0 {
 		return 0, fmt.Errorf("managed start failed")
 	}
@@ -149,7 +153,18 @@ func waitNative(h C.intptr_t) error {
 	return nil
 }
 func cancelNative(h C.intptr_t) { C.do_cancel(h) }
-func freeNative(h C.intptr_t)   { C.do_free(h) }
+func requestWriteNative(h C.intptr_t, data []byte) error {
+	if C.do_request_write(h, (*C.uchar)(unsafe.Pointer(&data[0])), C.int(len(data))) != 0 {
+		return fmt.Errorf("request write failed")
+	}
+	return nil
+}
+func requestEndNative(h C.intptr_t)        { C.do_request_end(h) }
+func responseStateNative(h C.intptr_t) int { return int(C.do_response_state(h)) }
+func responseReadNative(h C.intptr_t, data []byte) int {
+	return int(C.do_response_read(h, (*C.uchar)(unsafe.Pointer(&data[0])), C.int(len(data))))
+}
+func freeNative(h C.intptr_t) { C.do_free(h) }
 func completeNative(h C.intptr_t) error {
 	if C.do_complete(h) != 0 {
 		return fmt.Errorf("OnCompleted failed")
@@ -162,28 +177,20 @@ func shutdownNative() error {
 	}
 	return nil
 }
-func responseNative(h C.intptr_t) (int, []byte, []header, error) {
-	n := int(C.do_body_length(h))
-	if n < 0 {
-		return 0, nil, nil, fmt.Errorf("invalid body length")
-	}
-	body := make([]byte, n)
-	if n > 0 && int(C.do_copy_body(h, (*C.uchar)(unsafe.Pointer(&body[0])), C.int(n))) != n {
-		return 0, nil, nil, fmt.Errorf("copy body")
-	}
+func responseNative(h C.intptr_t) (int, []header, error) {
 	nh := int(C.do_copy_headers(h, nil, 0))
 	if nh < 0 {
-		return 0, nil, nil, fmt.Errorf("invalid headers length")
+		return 0, nil, fmt.Errorf("invalid headers length")
 	}
 	block := make([]byte, nh)
 	if nh > 0 && int(C.do_copy_headers(h, (*C.uchar)(unsafe.Pointer(&block[0])), C.int(nh))) != nh {
-		return 0, nil, nil, fmt.Errorf("copy headers")
+		return 0, nil, fmt.Errorf("copy headers")
 	}
 	headers, err := decodeHeaders(block)
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, err
 	}
-	return int(C.do_status(h)), body, headers, nil
+	return int(C.do_status(h)), headers, nil
 }
 
 // Length-prefixed UTF-8 pairs preserve ordering, duplicates, and empty values.

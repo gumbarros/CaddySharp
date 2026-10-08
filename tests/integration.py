@@ -47,7 +47,25 @@ def main():
    assert json.loads(req('/config')[1])['value']=='example'
    assert req('/error')[0]==500 and b'controlled' not in req('/error')[1]
    assert req('/echo','POST',b'x'*(1024*1024+1))[0]==413
-   assert req('/large')[0]==500
+   assert req('/large')[:2]==(200,bytes(5*1024*1024))
+   stream=http.client.HTTPConnection('127.0.0.1',PORT,timeout=15)
+   stream.request('GET','/stream-response')
+   response=stream.getresponse()
+   started=time.monotonic()
+   assert response.status==200 and response.read(6)==b'first\n'
+   assert time.monotonic()-started<.4, 'first response chunk was buffered'
+   assert response.read()==b'second\n'
+   stream.close()
+   observed=json.loads(req('/upload-observed')[1])
+   upload=socket.create_connection(('127.0.0.1',PORT),timeout=5)
+   upload.sendall(f'POST /stream-upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\n\r\n'.encode()+b'first')
+   for _ in range(30):
+    if json.loads(req('/upload-observed')[1])>observed:break
+    time.sleep(.02)
+   else:raise AssertionError('upload chunk was buffered')
+   upload.sendall(b'second')
+   assert b'received' in upload.recv(4096)
+   upload.close()
    assert req('/empty')[:2]==(204,b'')
    assert req('/inspect/abc','HEAD')[0]==200
    status,data,headers=req('/cookies');assert len([v for k,v in headers if k.lower()=='set-cookie'])==2

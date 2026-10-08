@@ -25,7 +25,6 @@ else:
    environment Production
    env SampleSettings__Value example
    max_request_body 1MB
-   max_response_body 4MB
    shutdown_timeout 30s
   }}
  }}

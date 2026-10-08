@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -42,5 +43,8 @@ func main() {
 			panic(err)
 		}
 	}
+	// The re-exec path sets this in the environment, but callers may already
+	// provide asyncpreemptoff=1 and bypass that path.
+	runtime.GOMAXPROCS(1)
 	caddycmd.Main()
 }

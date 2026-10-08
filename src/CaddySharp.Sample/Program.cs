@@ -10,6 +10,7 @@ public static class AppBootstrap
     private static int CallbackCount;
     private static int CancelCount;
     private static int StartupCount;
+    private static int UploadObserved;
 
     public static void Configure(WebApplicationBuilder builder)
     {
@@ -30,6 +31,23 @@ public static class AppBootstrap
             await request.Body.CopyToAsync(ms);
             return Results.Bytes(ms.ToArray(), "application/octet-stream");
         });
+        app.MapGet("/stream-response", async (HttpContext context) =>
+        {
+            context.Response.ContentType = "text/plain";
+            await context.Response.WriteAsync("first\n");
+            await context.Response.Body.FlushAsync();
+            await Task.Delay(500, context.RequestAborted);
+            await context.Response.WriteAsync("second\n");
+        });
+        app.MapPost("/stream-upload", async (HttpContext context) =>
+        {
+            var buffer = new byte[5];
+            await context.Request.Body.ReadExactlyAsync(buffer, context.RequestAborted);
+            Interlocked.Increment(ref UploadObserved);
+            await context.Request.Body.CopyToAsync(Stream.Null, context.RequestAborted);
+            await context.Response.WriteAsync("received");
+        });
+        app.MapGet("/upload-observed", () => Volatile.Read(ref UploadObserved));
         app.MapMethods("/inspect/{**rest}", ["GET", "POST", "PUT", "HEAD"],
             (HttpRequest r) => Results.Json(new
             {

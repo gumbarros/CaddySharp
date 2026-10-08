@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,7 +89,7 @@ func parseGlobal(d *caddyfile.Dispenser, existing any) (any, error) {
 			if _, exists := app.Apps[name]; exists {
 				return nil, d.Errf("duplicate app %s", name)
 			}
-			cfg := AppConfig{Environment: "Production", MaxRequestBody: 1 << 20, MaxResponseBody: 4 << 20, ShutdownTimeout: "30s", Env: map[string]string{}}
+			cfg := AppConfig{Environment: "Production", MaxRequestBody: 1 << 20, ShutdownTimeout: "30s", Env: map[string]string{}}
 			for d.NextBlock(1) {
 				key := d.Val()
 				args := d.RemainingArgs()
@@ -138,6 +139,9 @@ func parseGlobal(d *caddyfile.Dispenser, existing any) (any, error) {
 	return httpcaddyfile.App{Name: "aspnetcore", Value: caddyconfig.JSON(app, nil)}, nil
 }
 func parseSize(s string) (int64, error) {
+	if strings.EqualFold(s, "unlimited") {
+		return 0, nil
+	}
 	upper := strings.ToUpper(s)
 	mult := int64(1)
 	for _, u := range []struct {
@@ -202,8 +206,8 @@ func (a *App) Provision(ctx caddy.Context) error {
 				return fmt.Errorf("%s: %w", key, e)
 			}
 		}
-		if v.MaxRequestBody <= 0 || v.MaxResponseBody <= 0 {
-			return fmt.Errorf("body limits must be positive")
+		if v.MaxRequestBody < 0 || v.MaxResponseBody < 0 {
+			return fmt.Errorf("body limits must be nonnegative")
 		}
 		if _, e := time.ParseDuration(v.ShutdownTimeout); e != nil {
 			return e
@@ -227,6 +231,9 @@ func (a *App) Provision(ctx caddy.Context) error {
 }
 func (a *App) Start() (err error) {
 	defer func() { a.startErr = err; close(a.ready) }()
+	// Keep the mixed Go/CoreCLR process on the validated scheduler setting,
+	// including when this module is used from a custom Caddy launcher.
+	runtime.GOMAXPROCS(1)
 	global.Lock()
 	defer global.Unlock()
 	if global.started {
@@ -283,11 +290,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return r.Context().Err()
 	}
 	cfg := h.app.Apps[h.Name]
-	body, e := io.ReadAll(io.LimitReader(r.Body, cfg.MaxRequestBody+1))
-	if e != nil {
-		return e
-	}
-	if int64(len(body)) > cfg.MaxRequestBody {
+	if cfg.MaxRequestBody > 0 && r.ContentLength > cfg.MaxRequestBody {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return nil
 	}
@@ -315,14 +318,49 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return r.Context().Err()
 	}
 	defer func() { <-h.app.slots }()
-	handle, e := requestNative(r.Method, scheme, r.Host, path, r.RequestURI, query, r.RemoteAddr, body, hs, cfg.MaxResponseBody)
+	handle, e := requestNative(r.Method, scheme, r.Host, path, r.RequestURI, query, r.RemoteAddr, hs, cfg.MaxResponseBody)
 	if e != nil {
 		http.Error(w, "internal server error", 500)
 		return e
 	}
 	h.app.active.Add(1)
 	h.app.pending.Add(1)
+	inputDone := make(chan error, 1)
+	var inputFinished atomic.Bool
+	go func() {
+		defer func() { requestEndNative(handle); close(inputDone); inputFinished.Store(true) }()
+		buf := make([]byte, 32768)
+		var total int64
+		for {
+			n, readErr := r.Body.Read(buf)
+			if n > 0 {
+				total += int64(n)
+				if cfg.MaxRequestBody > 0 && total > cfg.MaxRequestBody {
+					inputDone <- errRequestTooLarge
+					return
+				}
+				if err := requestWriteNative(handle, buf[:n]); err != nil {
+					inputDone <- err
+					return
+				}
+			}
+			if readErr != nil {
+				if readErr == io.EOF {
+					inputDone <- nil
+				} else {
+					inputDone <- readErr
+				}
+				return
+			}
+		}
+	}()
 	defer func() {
+		if !inputFinished.Load() {
+			cancelNative(handle)
+			r.Body.Close()
+		}
+		<-inputDone
+		_ = waitNative(handle)
 		if err := completeNative(handle); err != nil {
 			log.Printf("caddysharp completion: %v", err)
 		}
@@ -330,19 +368,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		h.app.pending.Add(-1)
 		h.app.active.Done()
 	}()
-	done := make(chan error, 1)
-	go func() { done <- waitNative(handle) }()
-	select {
-	case e = <-done:
-	case <-r.Context().Done():
-		cancelNative(handle)
-		e = <-done
+	inputResult := inputDone
+	for responseStateNative(handle) == 0 {
+		select {
+		case e = <-inputResult:
+			inputResult = nil
+			if e != nil {
+				cancelNative(handle)
+				if e == errRequestTooLarge {
+					http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+					return nil
+				}
+				return e
+			}
+		case <-r.Context().Done():
+			cancelNative(handle)
+			return r.Context().Err()
+		default:
+			time.Sleep(500 * time.Microsecond)
+		}
 	}
-	if e != nil {
-		http.Error(w, "internal server error", 500)
-		return e
-	}
-	status, output, headers, e := responseNative(handle)
+	status, headers, e := responseNative(handle)
 	if e != nil {
 		http.Error(w, "internal server error", 500)
 		return e
@@ -350,15 +396,45 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	for _, v := range headers {
 		w.Header().Add(v.name, v.value)
 	}
-	if r.Method == "HEAD" && w.Header().Get("Content-Length") == "" {
-		w.Header().Set("Content-Length", strconv.Itoa(len(output)))
-	}
 	w.WriteHeader(status)
-	if r.Method != "HEAD" && status != 204 && status != 304 {
-		_, e = w.Write(output)
+	buf := make([]byte, 32768)
+	for {
+		select {
+		case <-r.Context().Done():
+			cancelNative(handle)
+			return r.Context().Err()
+		case e = <-inputResult:
+			inputResult = nil
+			if e != nil {
+				cancelNative(handle)
+				return e
+			}
+		default:
+		}
+		n := responseReadNative(handle, buf)
+		if n == -1 {
+			return nil
+		}
+		if n < -1 {
+			return fmt.Errorf("response read failed")
+		}
+		if n == 0 {
+			time.Sleep(500 * time.Microsecond)
+			continue
+		}
+		if r.Method != "HEAD" && status != 204 && status != 304 {
+			if _, e = w.Write(buf[:n]); e != nil {
+				cancelNative(handle)
+				return e
+			}
+			if flush, ok := w.(http.Flusher); ok {
+				flush.Flush()
+			}
+		}
 	}
-	return e
 }
+
+var errRequestTooLarge = fmt.Errorf("request body too large")
 
 var _ caddy.App = (*App)(nil)
 var _ caddy.Provisioner = (*App)(nil)
